@@ -1,0 +1,4 @@
+.venv
+.vscode
+src/python-back-end/__pycache__/
+src/ignored-files
