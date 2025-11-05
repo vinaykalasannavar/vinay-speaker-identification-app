@@ -22,6 +22,25 @@ with open("config.json", encoding="utf-8") as f:
 AZURE_COSMOS_URI = os.environ['AZURE_COSMOS_URI']
 AZURE_COSMOS_KEY = os.environ['AZURE_COSMOS_KEY']
 
+# Local ASR using Hugging Face transformers (Whisper)
+try:
+    from transformers import pipeline
+    import torch as _torch
+
+    _device = 0 if _torch.cuda.is_available() else -1
+    # NOTE: this will download the model the first time it's run and can be large.
+    # Use environment override if provided; default to the latest Whisper model
+    ASR_MODEL_NAME = os.environ.get("ASR_MODEL_NAME", "openai/whisper-tiny")
+    try:
+        asr_pipeline = pipeline("automatic-speech-recognition", model=ASR_MODEL_NAME, device=_device, generate_kwargs={"language": "english", "task": "transcribe"})
+    except Exception as _e:
+        # If model fails to load, set pipeline to None and surface error at request time.
+        asr_pipeline = None
+        print(f"Warning: failed to initialize ASR pipeline: {_e}")
+except Exception as _e:
+    asr_pipeline = None
+    print(f"Warning: transformers pipeline not available: {_e}")
+
 DATABASE_NAME = config.get("database_name", "speakerdb")
 CONTAINER_NAME = config.get("container_name", "speakers")
 
@@ -169,7 +188,7 @@ async def enroll_speaker(file: UploadFile, name: str):
         save_speaker(name, emb)
         # print(f'VINAY_DEBUG: speaker_db now has {speaker_db[name]} samples for {name}.')
         # count = len(speaker[name])
-        count = 'MORE_THAN_ONE' # Placeholder until we implement persistent storage
+        count = len(speaker_db[name])
     else:
         # print(f'VINAY_DEBUG: No existing speaker found. Creating new entry for {name}.')
         save_speaker(name, emb)
@@ -225,6 +244,47 @@ def list_speakers():
     # print(f'VINAY_DEBUG: list_speakers returning {items}')
 
     return {item: data for item, data in speaker_db.items()}
+
+
+@app.post("/transcribe")
+async def transcribe_audio(file: UploadFile):
+    """Accept an uploaded audio file and transcribe using a local Hugging Face transformers pipeline.
+
+    The server initializes a local ASR pipeline at startup. The model may be large and will be
+    downloaded the first time; ensure the server has enough disk space and memory.
+    Returns JSON: {"text": "transcribed text"}
+    """
+    if asr_pipeline is None:
+        return {"error": "ASR pipeline not available on server. Ensure 'transformers' is installed and the model can be loaded."}
+
+    audio_bytes = await file.read()
+
+    # Convert webm/opus bytes to wav bytes (16k mono) using existing util
+    wav_buffer = convert_to_wav(audio_bytes)
+
+    # Write to a temporary file and let the transformers pipeline read it (robust and simple)
+    # Try to pass the in-memory wav buffer directly to the pipeline.
+    # If that fails, load the waveform and pass a numpy array + sampling rate.
+    wav_buffer.seek(0)
+    try:
+        result = asr_pipeline(wav_buffer)
+    except Exception as e1:
+        wav_buffer.seek(0)
+        waveform, sr = torchaudio.load(wav_buffer)
+
+        # Collapse multi-channel to mono by averaging channels, convert to numpy float32
+        if waveform.ndim > 1:
+            arr = waveform.mean(dim=0).cpu().numpy().astype("float32")
+        else:
+            arr = waveform.squeeze().cpu().numpy().astype("float32")
+        print(f"VINAY_DEBUG: Converted waveform to array with shape {arr.shape}, arr.ndim: {arr.ndim}")
+        result = asr_pipeline(arr)
+        
+    # result is usually a dict with 'text'
+    if isinstance(result, dict):
+        return {"text": result.get("text"), "raw": result}
+    else:
+        return {"text": str(result)}
 
 if __name__ == "__main__":
     uvicorn.run(

@@ -6,7 +6,16 @@ function App() {
   const [name, setName] = useState("");
   const [audioBlob, setAudioBlob] = useState<Blob | null>(null);
   const [result, setResult] = useState<object | null>(null);
+  const [transcript, setTranscript] = useState<string | null>(null);
+  interface TranscriptEntry {
+    id: string;
+    message: string;
+    audioBlob: Blob;
+  }
+  // const previousTranscripts:string[]  = [];
+  const [previousTranscripts, setPreviousTranscripts] = useState<TranscriptEntry[]>([]);
 
+  // Function to start recording audio  
   const startRecording = () => {
     setAudioBlob(null);
     navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
@@ -37,17 +46,51 @@ function App() {
     const res = await axios.post(url, formData, {
       headers: { "Content-Type": "multipart/form-data" },
     });
-    console.log(`res = `, res);
     setResult(res.data);
+    if (endpoint === "enroll") {
+      transcribe().then(() => {
+        console.log("Transcription after enrollment done");
+      }, (err) => {
+        console.error("Transcription after enrollment error", err);
+      });
+    }
   };
+
+  const transcribe = async () => {
+    if (!audioBlob) return;
+
+    const formData = new FormData();
+    formData.append("file", audioBlob, "audio.webm");
+
+    try {
+      const res = await axios.post(`${BACKEND_URL}/transcribe`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      // Expecting { text: "..." }
+      const transcribedMessage = res.data?.text ?? JSON.stringify(res.data);
+      setTranscript(transcribedMessage);
+
+      setPreviousTranscripts([{id: self.crypto.randomUUID(),  message: transcribedMessage, audioBlob: audioBlob}, ...previousTranscripts]);
+    } catch (err: unknown) {
+      console.error("Transcription error", err);
+      let msg = "unknown error";
+      if (err instanceof Error) msg = err.message;
+      else if (typeof err === "string") msg = err;
+      setTranscript("Transcription failed: " + msg);      
+    }
+  };
+
+  function playThisAudio(audioBlob: Blob) {
+    const audioUrl = URL.createObjectURL(audioBlob);
+    const audio = new Audio(audioUrl);
+    audio.play();
+  }
 
   const playRecording = () => {
     if (!audioBlob) {
       console.log("No audio recorded yet");
       return};
-    const audioUrl = URL.createObjectURL(audioBlob);
-    const audio = new Audio(audioUrl);
-    audio.play();
+    playThisAudio(audioBlob);
   };
 
   return (
@@ -60,21 +103,75 @@ function App() {
         value={name}
         onChange={(e) => setName(e.target.value)}
       />
+      
+      <button onClick={() => sendToServer("enroll")} disabled={!name || !audioBlob}>Enroll</button>
+      {result && <pre>{JSON.stringify(result, null, 2)}</pre>}
       <br />
       <br />
 
       <button onClick={startRecording}>🎙️ Record 3s</button>
       <button onClick={playRecording} disabled={!audioBlob}>▶️ Play Recorded Message</button>
+      <button onClick={() => sendToServer("identify")}> 👤❓Identify Me</button>
+      <br />
+      <br />
+      
+      <button onClick={transcribe} disabled={!audioBlob}>Transcribe</button>
+      <span>{transcript}</span>
 
       <br />
       <br />
 
-      <button onClick={() => sendToServer("enroll")}>Enroll</button>
-      <button onClick={() => sendToServer("identify")}>Identify</button>
-      <br />
-      <br />
+      
+      
+      {previousTranscripts.length > 0 && (
+        <div>
+          <h3>Transcription History</h3>
+          {/* <ul>
+            {previousTranscripts.map((elem) => (
+              <li key="{elem.id}">
+                <span>{elem.id}</span>
+                <span>{elem.message}</span>
+                <button onClick={()=>{playThisAudio(elem.audioBlob)}}>▶️</button>
+                <button onClick={()=>{
+                  setPreviousTranscripts(previousTranscripts.filter(e=>e.id!==elem.id));
+                }}>❌</button>
+              </li>
+            ))}
+          </ul> */}
 
-      {result && <pre>{JSON.stringify(result, null, 2)}</pre>}
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Message</th>
+                <th>Play</th>
+                <th>Delete</th>
+              </tr>
+            </thead>
+          <tbody>
+            {previousTranscripts.map((elem) => (
+              <tr key={elem.id}>
+                <td>{elem.id}</td>
+                <td>{elem.message}</td>
+                <td>
+                  <button onClick={() => playThisAudio(elem.audioBlob)}>▶️</button>
+                </td>
+                <td>
+                  <button
+                    onClick={() => {
+                      setPreviousTranscripts(previousTranscripts.filter(e => e.id !== elem.id));
+                    }}
+                  >
+                    ❌
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+</table>
+
+        </div>
+      )}
     </div>
   );
 }
