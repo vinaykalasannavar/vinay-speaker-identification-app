@@ -73,29 +73,41 @@ function App() {
     });
   };
 
-  const sendToServer = async (endpoint: "enroll" | "identify") => {
-    if (!audioBlob) return;
+ const sendToServer = async (endpoint: "enroll" | "identify") => {
+   if (!audioBlob) return;
 
-    const formData = new FormData();
-    formData.append("file", audioBlob, "audio.webm");
+   const formData = new FormData();
+   formData.append("file", audioBlob, "audio.webm");
 
-    let recordingId: string | null = null;
+   let recordingId: string | null = null;
 
-    if (endpoint === "enroll") {
-      recordingId = crypto.randomUUID();
-      formData.append("recording_id", recordingId);
-    }
+   if (endpoint === "enroll") {
+     recordingId = crypto.randomUUID();
+     formData.append("recording_id", recordingId);
+   }
 
-    let url = `${BACKEND_URL}/${endpoint}`;
-    if (endpoint === "enroll" && name) url += `/${name}`;
+   let url = `${BACKEND_URL}/${endpoint}`;
+   if (endpoint === "enroll" && name) url += `/${name}`;
 
-    const res = await axios.post(url, formData);
-    setResult(res.data);
+   const res = await axios.post(url, formData);
+   setResult(res.data);
 
-    if (endpoint === "enroll") {
-      await transcribe(audioBlob, null, name, recordingId);
-    }
-  };
+   // ✅ ADD DIRECTLY TO HISTORY (no extra API call)
+   if (endpoint === "enroll") {
+     const text = res.data.text ?? "";
+
+     setPreviousTranscripts((prev) => [
+       {
+         id: recordingId!,
+         name: name,
+         message: text,
+         audioBlob: audioBlob,
+         speaker: name,
+       },
+       ...prev,
+     ]);
+   }
+ };
 
   const transcribe = async (
     inputAudioBlob: Blob | null,
@@ -151,6 +163,7 @@ function App() {
     try {
       await axios.delete(`${BACKEND_URL}/transcripts?confirm=true`);
       setPreviousTranscripts([]);
+      setResult(null);
     } catch (err) {
       console.error("Clear all failed", err);
     }
@@ -254,7 +267,7 @@ function App() {
           👤 Identify Me
         </button>
 
-        <button className="danger" onClick={clearAll}>
+        <button className="danger" onClick={clearAll} disabled={!(previousTranscripts.length > 0)}>
           🧹 Clear All
         </button>
 
