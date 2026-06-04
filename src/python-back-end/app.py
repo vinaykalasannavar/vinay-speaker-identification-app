@@ -7,6 +7,7 @@ import io
 import ffmpeg
 import base64
 from speechbrain.inference import SpeakerRecognition
+from scipy.io import wavfile
 
 import uvicorn
 import json
@@ -26,24 +27,15 @@ with open("config.json", encoding="utf-8") as f:
 AZURE_COSMOS_URI = os.environ['AZURE_COSMOS_URI']
 AZURE_COSMOS_KEY = os.environ['AZURE_COSMOS_KEY']
 
-# Local ASR using Hugging Face transformers (Whisper)
+# Local ASR using OpenAI Whisper
+asr_model = None
 try:
-    from transformers import pipeline
-    import torch as _torch
-
-    _device = 0 if _torch.cuda.is_available() else -1
-    # NOTE: this will download the model the first time it's run and can be large.
-    # Use environment override if provided; default to the latest Whisper model
-    ASR_MODEL_NAME = os.environ.get("ASR_MODEL_NAME", "openai/whisper-tiny")
-    try:
-        asr_pipeline = pipeline("automatic-speech-recognition", model=ASR_MODEL_NAME, device=_device, generate_kwargs={"language": "english", "task": "transcribe"})
-    except Exception as _e:
-        # If model fails to load, set pipeline to None and surface error at request time.
-        asr_pipeline = None
-        print(f"Warning: failed to initialize ASR pipeline: {_e}")
+    import whisper
+    asr_model = whisper.load_model("tiny")
+    print("ASR model loaded successfully")
 except Exception as _e:
-    asr_pipeline = None
-    print(f"Warning: transformers pipeline not available: {_e}")
+    asr_model = None
+    print(f"Warning: failed to initialize ASR model: {_e}")
 
 DATABASE_NAME = config.get("database_name", "speakerdb")
 CONTAINER_NAME = config.get("container_name", "speakers")
@@ -94,15 +86,31 @@ def convert_to_wav(audio_bytes):
         .output('pipe:1', format='wav', acodec='pcm_s16le', ac=1, ar='16k')
         .run_async(pipe_stdin=True, pipe_stdout=True, pipe_stderr=True, quiet=True)
     )
-    wav_data, _ = process.communicate(input=in_buffer.read())
+    wav_data, stderr = process.communicate(input=in_buffer.read())
+    if process.returncode != 0:
+        raise RuntimeError(f"FFmpeg failed converting audio: {stderr.decode('utf-8', errors='ignore')}")
     out_buffer.write(wav_data)
     out_buffer.seek(0)
     return out_buffer
 
+
 def get_embedding(audio_bytes):
     wav_buffer = convert_to_wav(audio_bytes)
-
-    waveform, sr = torchaudio.load(wav_buffer)
+    wav_buffer.seek(0)
+    
+    # Load wav using scipy instead of torchaudio to avoid torchcodec issues
+    sr, waveform_numpy = wavfile.read(wav_buffer)
+    
+    # Convert numpy array to torch tensor
+    waveform = torch.from_numpy(waveform_numpy.copy()).float()
+    
+    # Handle mono vs stereo
+    if waveform.ndim == 1:
+        waveform = waveform.unsqueeze(0)
+    elif waveform.shape[0] > 1:
+        # Take first channel if stereo
+        waveform = waveform[0].unsqueeze(0)
+    
     if sr != 16000:
         waveform = torchaudio.functional.resample(waveform, sr, 16000)
     emb = spkrec.encode_batch(waveform)
@@ -193,32 +201,34 @@ async def transcribe(file: UploadFile, recording_id: str = Form(...), speaker_na
     return {"text": text, "timestamp": timestamp}
 
 def extractTextFromAudio(audio_bytes):
-    if asr_pipeline is None:
-        print("ASR pipeline not available")
+    if asr_model is None:
+        print("ASR model not available")
         return "[ASR unavailable]"
 
-    wav = convert_to_wav(audio_bytes)
-    wav.seek(0)
+    wav_file = convert_to_wav(audio_bytes)
+    wav_file.seek(0)
 
     try:
-        result = asr_pipeline(wav)
-    except Exception as e1:
-        wav.seek(0)
-        waveform, sr = torchaudio.load(wav)
-
-        # Collapse multi-channel to mono by averaging channels, convert to numpy float32
-        if waveform.ndim > 1:
-            arr = waveform.mean(dim=0).cpu().numpy().astype("float32")
+        sr, audio_np = wavfile.read(wav_file)
+        if audio_np.dtype.kind in 'iu':
+            audio = audio_np.astype(np.float32) / np.iinfo(audio_np.dtype).max
         else:
-            arr = waveform.squeeze().cpu().numpy().astype("float32")
-        print(f"VINAY_DEBUG: Converted waveform to array with shape {arr.shape}, arr.ndim: {arr.ndim}")
-        result = asr_pipeline(arr)
-        
-    # result is usually a dict with 'text'
-    if isinstance(result, dict):
-        return result.get("text")
-    else:
-        return str(result)
+            audio = audio_np.astype(np.float32)
+
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+
+        if sr != 16000:
+            audio_tensor = torch.from_numpy(audio).unsqueeze(0)
+            audio_resampled = torchaudio.functional.resample(audio_tensor, sr, 16000)
+            audio = audio_resampled.squeeze(0).numpy()
+
+        result = asr_model.transcribe(audio, language="en")
+        text = result.get("text", "[No transcription]").strip()
+        return text if text else "[No speech detected]"
+    except Exception as e:
+        print(f"ASR transcription error: {e}")
+        return f"[Transcription error]"
 
 @app.get("/transcripts")
 def transcripts():
