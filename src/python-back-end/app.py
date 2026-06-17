@@ -28,13 +28,13 @@ AZURE_COSMOS_URI = os.environ['AZURE_COSMOS_URI']
 AZURE_COSMOS_KEY = os.environ['AZURE_COSMOS_KEY']
 
 # Local ASR using OpenAI Whisper
-asr_model = None
+whisper_asr_model = None
 try:
     import whisper
-    asr_model = whisper.load_model("tiny")
+    whisper_asr_model = whisper.load_model("tiny")
     print("ASR model loaded successfully")
 except Exception as _e:
-    asr_model = None
+    whisper_asr_model = None
     print(f"Warning: failed to initialize ASR model: {_e}")
 
 DATABASE_NAME = config.get("database_name", "speakerdb")
@@ -201,7 +201,7 @@ async def transcribe(file: UploadFile, recording_id: str = Form(...), speaker_na
     return {"text": text, "timestamp": timestamp}
 
 def extractTextFromAudio(audio_bytes):
-    if asr_model is None:
+    if whisper_asr_model is None:
         print("ASR model not available")
         return "[ASR unavailable]"
 
@@ -209,21 +209,21 @@ def extractTextFromAudio(audio_bytes):
     wav_file.seek(0)
 
     try:
-        sr, audio_np = wavfile.read(wav_file)
-        if audio_np.dtype.kind in 'iu':
-            audio = audio_np.astype(np.float32) / np.iinfo(audio_np.dtype).max
+        sample_rate, audio_numpy_array = wavfile.read(wav_file)
+        if audio_numpy_array.dtype.kind in 'iu':
+            audio = audio_numpy_array.astype(np.float32) / np.iinfo(audio_numpy_array.dtype).max
         else:
-            audio = audio_np.astype(np.float32)
+            audio = audio_numpy_array.astype(np.float32)
 
         if audio.ndim > 1:
             audio = audio.mean(axis=1)
 
-        if sr != 16000:
+        if sample_rate != 16000:
             audio_tensor = torch.from_numpy(audio).unsqueeze(0)
-            audio_resampled = torchaudio.functional.resample(audio_tensor, sr, 16000)
+            audio_resampled = torchaudio.functional.resample(audio_tensor, sample_rate, 16000)
             audio = audio_resampled.squeeze(0).numpy()
 
-        result = asr_model.transcribe(audio, language="en")
+        result = whisper_asr_model.transcribe(audio, language="en")
         text = result.get("text", "[No transcription]").strip()
         return text if text else "[No speech detected]"
     except Exception as e:
